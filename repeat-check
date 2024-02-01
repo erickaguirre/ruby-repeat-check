@@ -1,0 +1,158 @@
+#!/usr/bin/ruby
+
+# usage:
+#  repeat-check [dir...] [num_check] [num_process]
+
+require 'rbconfig'
+require 'fileutils'
+require 'time'
+
+$:.unshift File.join(File.dirname(__FILE__), 'lib')
+require 'escape'
+
+$ltsv_log = open("z.log.ltsv", "a")
+$ltsv_log.sync = true
+
+def log(reason, fmt, param)
+  t = Time.now
+  msg = fmt.gsub(/\{([^{}]+)\}/) { param.fetch($1) }
+  print "#{t.iso8601} #{msg}\n"
+  h = { "time"=>t.iso8601, "reason"=>reason }
+  param.each {|k, v|
+    h[k.to_s] = v.to_s
+  }
+  ltsv_line = Escape.ltsv_line(h)
+  $ltsv_log.print ltsv_line
+end
+
+def get_ruby_rev(dir)
+  `#{dir}/ruby/ruby -e 'p RUBY_REVISION'`.chomp
+end
+
+def spawn_worker(pids, rev, d, i)
+  pid = spawn(RbConfig.ruby, $0, '--worker--', rev, d, i.to_s)
+  pids[pid] = [rev, d, i]
+  log 'check_start', '{dir}: r{rev} {i} pid:{pid} start', "dir"=>d, "rev"=>rev, "i"=>i, "pid"=>pid
+end
+
+def wait_worker(pids)
+  pid = Process.wait
+  rev, d, i = pids[pid]
+  error = File.exist?("#{d}/out/r#{rev}/error/#{i}") ? "failure" : "success"
+  h = { "dir"=>d, "rev"=>rev, "i"=>i, "pid"=>pid, "result"=>error }
+  %w[
+    elapsed-seconds
+    start-time
+    end-time
+    status
+    version
+  ].each {|fn|
+    begin
+      h[fn] = File.read("#{d}/out/r#{rev}/#{i}/#{fn}").chomp
+    rescue SystemCallError
+    end
+  }
+  log 'check_end', '{dir}: r{rev} {i} pid:{pid} end ({result})', h
+  pids.delete(pid)
+end
+
+def master
+  dirs = []
+  while !ARGV.empty? && /\A[0-9]*\z/ !~ ARGV.first
+    dirs << ARGV.shift
+  end
+  if dirs.empty?
+    dirs = Dir.glob("*/ruby/ruby").map {|s| File.dirname(File.dirname(s)) }.sort
+  end
+
+  if !ARGV.empty?
+    num_check = ARGV.shift.to_i
+  else
+    num_check = 100
+  end
+
+  if !ARGV.empty?
+    num_process = ARGV.shift.to_i
+  else
+    num_process = 9
+  end
+
+  pids = {}
+  dirs.each {|d|
+    rev = get_ruby_rev(d)
+    filenames = Dir.entries("#{d}/out/r#{rev}") rescue nil
+    filenames ||= []
+    old_max = filenames.grep(/\A[0-9]+\z/).map {|n| n.to_i }.max
+    old_max ||= -1
+    base = old_max + 1
+    if 1 < num_check
+      base = ((base + num_check - 1) / num_check) * num_check
+    end
+    num_check.times {|i|
+      i += base
+      if num_process <= pids.size
+        wait_worker(pids)
+      end
+      spawn_worker(pids, rev, d, i)
+    }
+  }
+  while !pids.empty?
+    wait_worker(pids)
+  end
+end
+
+def worker
+  rev = ARGV.shift
+  dir = ARGV.shift
+  i = ARGV.shift
+  actual_rev = get_ruby_rev(dir)
+  FileUtils.mkpath "error"
+  Dir.chdir "#{dir}/ruby"
+  d = "../out/r#{rev}"
+  d_error = "#{d}/error"
+  FileUtils.mkpath d_error
+  File.open("#{d}/.log.#{Time.now.strftime("%FT%T")}.#{$$}", File::CREAT|File::WRONLY|File::EXCL) {|log1|
+    log1.sync = true
+    d_i = "#{d}/#{i}"
+    begin
+      Dir.mkdir d_i
+    rescue Errno::EEXIST
+      return
+    end
+    t1 = Time.now
+    log1.puts t1.strftime("start-time=%s %FT%T%z")
+    log1.puts "rev=#{rev}"
+    log1.puts "actual-rev=#{actual_rev}"
+    log1.puts "number=#{i}"
+    File.open("#{d_i}/RUNNING", "w") {|f| f.puts t1.iso8601 }
+    File.open("#{d_i}/start-time", "w") {|f| f.puts t1.iso8601 }
+    system("./ruby -v > #{d_i}/version")
+    d_i_tmp = "#{d_i}/tmp"
+    Dir.mkdir(d_i_tmp)
+    ENV['TMPDIR'] = d_i_tmp
+    check_pid = spawn("timeout 20m make -d check TESTS='-v --hide-skip'", [:out, :err] => ["#{d_i}/log", "w"])
+    File.open("#{d_i}/pid", "w") {|f| f.puts check_pid.to_s }
+    Process.wait check_pid
+    status = $?
+    File.open("#{d_i}/status", "w") {|f| f.puts status.to_s.sub(/\Apid \d+ /, '') }
+    t2 = Time.now
+    File.open("#{d_i}/end-time", "w") {|f| f.puts t2.iso8601 }
+    File.open("#{d_i}/elapsed-seconds", "w") {|f| f.puts(t2-t1) }
+    if !status.success?
+      File.symlink("../#{i}", "#{d_error}/#{i}")
+      t1_str = t1.getutc.strftime("%Y%m%dT%H%M%SZ")
+      File.symlink("../#{dir}/out/r#{rev}/#{i}/log", "../../error/#{t1_str}.r#{rev}.#{dir}.#{i}.log")
+    end
+    File.unlink("#{d_i}/RUNNING")
+    log1.puts t2.strftime("end-time=%s %FT%T%z")
+  }
+end
+
+STDOUT.sync = true
+if ARGV.first == '--worker--'
+  ARGV.shift
+  worker
+else
+  master
+end
+
